@@ -31,6 +31,14 @@ user_unauthorized = _signals.signal("unauthorized")
 #: receives no additional arguments besides the app.
 user_needs_refresh = _signals.signal("needs-refresh")
 
+#: Sent when a view protected with :func:`~flask_login.reauth_required`
+#: rejects an authenticated user because their freshness proof is missing,
+#: too old, or based on an authentication method that is too weak. In
+#: addition to the app (which is the sender), it receives a ``reason``
+#: keyword argument holding a :class:`~flask_login.ReauthReason` value. The
+#: reason never contains credentials or other secrets.
+reauthentication_required = _signals.signal("reauthentication-required")
+
 #: Sent whenever the user is accessed/loaded
 #: receives no additional arguments besides the app.
 user_accessed = _signals.signal("accessed")

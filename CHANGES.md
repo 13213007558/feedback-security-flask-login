@@ -18,6 +18,16 @@ Unreleased
 - Never look at the `X-Forwarded-For` header, always use `request.remote_addr`,
   requiring the developer to configure `ProxyFix` appropriately. #700
 - Remove `LOGIN_DISABLED` config. #697
+- Add `reauth_required(max_age, min_level)` so sensitive views can declare the
+  maximum age and minimum authentication method level of a fresh login. A fresh
+  proof (`_fresh_at`, `_fresh_level`) is written only by `login_user` with
+  `fresh=True` and by `confirm_login`; non-fresh logins, "remember me"
+  restoration, logout and session protection never preserve or invent one.
+  Rejections carry a secret-free `ReauthReason` through the
+  `reauthentication_required` signal and the new `LoginManager.reauth_handler`
+  callback, while `fresh_login_required` and the legacy `needs_refresh` flow are
+  unchanged. Adds `fresh_login_age`, `fresh_auth_level`, and an injectable
+  `LoginManager.now()` clock for deterministic tests.
 
 
 Version 0.6.3

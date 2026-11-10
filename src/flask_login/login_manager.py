@@ -23,6 +23,7 @@ from .config import REFRESH_MESSAGE_CATEGORY
 from .config import SESSION_KEYS
 from .config import USE_SESSION_FOR_NEXT
 from .mixins import AnonymousUserMixin
+from .signals import reauthentication_required
 from .signals import session_protected
 from .signals import user_accessed
 from .signals import user_loaded_from_cookie
@@ -92,6 +93,12 @@ class LoginManager:
 
         self.needs_refresh_callback = None
 
+        #: Callback invoked when a view protected with
+        #: :func:`~flask_login.reauth_required` rejects a request. It receives
+        #: the :class:`~flask_login.ReauthReason` describing why
+        #: re-authentication is required and should return a response.
+        self.reauth_callback = None
+
         self.id_attribute = ID_ATTRIBUTE
 
         self._user_callback = None
@@ -99,6 +106,12 @@ class LoginManager:
         self._request_callback = None
 
         self._session_identifier_generator = _create_identifier
+
+        #: Optional fixed/callable clock used for every freshness timestamp.
+        #: When set, it must return a timezone-aware :class:`~datetime.datetime`
+        #: in UTC. This is primarily intended for tests that need to exercise
+        #: freshness timeouts deterministically.
+        self._now = None
 
         if app is not None:
             self.init_app(app, add_context_processor)
@@ -120,6 +133,18 @@ class LoginManager:
 
         if add_context_processor:
             app.context_processor(_user_context_processor)
+
+    def now(self):
+        """Return the current time as a timezone-aware UTC
+        :class:`~datetime.datetime`.
+
+        All freshness timestamps are stamped through this method. Tests can
+        install a fixed clock by assigning a zero-argument callable returning
+        a timezone-aware datetime to ``login_manager._now``.
+        """
+        if self._now is not None:
+            return self._now()
+        return datetime.now(timezone.utc)
 
     def unauthorized(self):
         """
@@ -239,7 +264,23 @@ class LoginManager:
         self.needs_refresh_callback = callback
         return callback
 
-    def needs_refresh(self):
+    def reauth_handler(self, callback):
+        """
+        This sets the callback used by :func:`~flask_login.reauth_required`
+        when an authenticated user does not satisfy the view's freshness or
+        authentication-level requirement. The callback receives a single
+        :class:`~flask_login.ReauthReason` argument (which never carries
+        secrets) and should return a response to be sent to the user instead
+        of their normal view. If no callback is registered, requests fall
+        back to :meth:`needs_refresh`.
+
+        :param callback: The callback for users that must re-authenticate.
+        :type callback: callable
+        """
+        self.reauth_callback = callback
+        return callback
+
+    def needs_refresh(self, reason=None):
         """
         This is called when the user is logged in, but they need to be
         reauthenticated because their session is stale. If you register a
@@ -253,16 +294,36 @@ class LoginManager:
               query string variable, so you can redirect there if present
               instead of the homepage.)
 
+        When called with a ``reason`` (as :func:`~flask_login.reauth_required`
+        does), the :data:`~flask_login.reauthentication_required` signal is
+        emitted carrying that reason and a callback registered with
+        :meth:`reauth_handler` takes precedence. Without a reason the legacy
+        :data:`~flask_login.user_needs_refresh` signal and
+        :meth:`needs_refresh_handler` callback are used instead, which keeps
+        :func:`~flask_login.fresh_login_required` behavior unchanged.
+
         If :attr:`LoginManager.refresh_view` is not defined, then it will
         simply raise a HTTP 401 (Unauthorized) error instead.
 
         This should be returned from a view or before/after_request function,
         otherwise the redirect will have no effect.
-        """
-        user_needs_refresh.send(current_app._get_current_object())
 
-        if self.needs_refresh_callback:
-            return self.needs_refresh_callback()
+        :param reason: Why re-authentication is required, or ``None`` for the
+            legacy freshness-only flow.
+        :type reason: ReauthReason
+        """
+        app = current_app._get_current_object()
+
+        if reason is None:
+            user_needs_refresh.send(app)
+            if self.needs_refresh_callback:
+                return self.needs_refresh_callback()
+        else:
+            reauthentication_required.send(app, reason=reason)
+            if self.reauth_callback is not None:
+                return self.reauth_callback(reason)
+            if self.needs_refresh_callback:
+                return self.needs_refresh_callback()
 
         if not self.refresh_view:
             abort(401)
@@ -351,6 +412,11 @@ class LoginManager:
             if mode == "basic" or sess.permanent:
                 if sess.get("_fresh") is not False:
                     sess["_fresh"] = False
+                # The old freshness proof no longer applies once the session
+                # is marked stale, so its timestamp and method level must go
+                # with it.
+                sess.pop("_fresh_at", None)
+                sess.pop("_fresh_level", None)
                 session_protected.send(app)
                 return False
             elif mode == "strong":
@@ -368,6 +434,11 @@ class LoginManager:
         if user_id is not None:
             session["_user_id"] = user_id
             session["_fresh"] = False
+            # A remembered session cannot claim a fresh authentication: it
+            # neither gets a new authentication timestamp nor a method level.
+            # Drop any stale proof rather than letting it survive the restore.
+            session.pop("_fresh_at", None)
+            session.pop("_fresh_level", None)
             user = None
             if self._user_callback:
                 user = self._user_callback(user_id)

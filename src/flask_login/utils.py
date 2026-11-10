@@ -1,4 +1,5 @@
 import hmac
+from datetime import timedelta
 from functools import wraps
 from hashlib import sha512
 from urllib.parse import parse_qs
@@ -16,6 +17,8 @@ from werkzeug.local import LocalProxy
 
 from .config import COOKIE_NAME
 from .config import EXEMPT_METHODS
+from .reauth import DEFAULT_AUTH_LEVEL
+from .reauth import ReauthReason
 from .signals import user_logged_in
 from .signals import user_logged_out
 from .signals import user_login_confirmed
@@ -137,6 +140,42 @@ def login_fresh():
     return session.get("_fresh", False)
 
 
+def _fresh_proof():
+    """Return ``(timestamp, level)`` of the current freshness proof, or
+    ``(None, None)`` when the session carries no valid proof.
+
+    A session restored from a "remember me" cookie only sets ``_fresh`` to
+    ``False`` and writes no proof, so a missing timestamp means no proof even
+    if a stale ``_fresh`` flag is present.
+    """
+    fresh_at = session.get("_fresh_at")
+    if not session.get("_fresh", False) or fresh_at is None:
+        return None, None
+    return fresh_at, session.get("_fresh_level", DEFAULT_AUTH_LEVEL)
+
+
+def fresh_login_age():
+    """Return the age of the current freshness proof as a
+    :class:`~datetime.timedelta`, or ``None`` when the session is not fresh.
+
+    The age is measured against the :class:`~flask_login.LoginManager` clock,
+    which tests can pin to a fixed time.
+    """
+    fresh_at, _ = _fresh_proof()
+    if fresh_at is None:
+        return None
+    return current_app.login_manager.now() - fresh_at
+
+
+def fresh_auth_level():
+    """Return the method level of the current freshness proof, or ``None``
+    when the session is not fresh. A fresh proof written without an explicit
+    level reports :data:`~flask_login.DEFAULT_AUTH_LEVEL`.
+    """
+    _, level = _fresh_proof()
+    return level
+
+
 def login_remembered():
     """
     This returns ``True`` if the current login is remembered across sessions.
@@ -151,7 +190,7 @@ def login_remembered():
     return False
 
 
-def login_user(user, remember=False, duration=None, force=False, fresh=True):
+def login_user(user, remember=False, duration=None, force=False, fresh=True, auth_level=None):
     """
     Logs a user in. You should pass the actual user object to this. If the
     user's `is_active` property is ``False``, they will not be logged in
@@ -159,6 +198,13 @@ def login_user(user, remember=False, duration=None, force=False, fresh=True):
 
     This will return ``True`` if the log in attempt succeeds, and ``False`` if
     it fails (i.e. because the user is inactive).
+
+    A fresh login (``fresh=True``, the default) writes a freshness proof made
+    of the current time and an authentication method level. The level is the
+    given `auth_level` (an ``int``), or :data:`~flask_login.DEFAULT_AUTH_LEVEL`
+    when it is omitted. A non-fresh login (``fresh=False``) writes no proof at
+    all, so views protected by :func:`fresh_login_required` or
+    :func:`reauth_required` keep demanding a real re-authentication.
 
     :param user: The user object to log in.
     :type user: object
@@ -174,14 +220,33 @@ def login_user(user, remember=False, duration=None, force=False, fresh=True):
     :param fresh: setting this to ``False`` will log in the user with a session
         marked as not "fresh". Defaults to ``True``.
     :type fresh: bool
+    :param auth_level: The strength of the authentication method used for
+        this login, as an ``int``. Only recorded for fresh logins; it is
+        ignored for non-fresh logins. Defaults to ``None``, which records
+        :data:`~flask_login.DEFAULT_AUTH_LEVEL`.
+    :type auth_level: int
     """
     if not force and not user.is_active:
         return False
+
+    if auth_level is not None and not isinstance(auth_level, int):
+        raise TypeError("auth_level must be an int or None")
 
     user_id = getattr(user, current_app.login_manager.id_attribute)()
     session["_user_id"] = user_id
     session["_fresh"] = fresh
     session["_id"] = current_app.login_manager._session_identifier_generator()
+
+    # Only a genuine fresh authentication may stamp a timestamp and a method
+    # level. Any previous proof is replaced for fresh logins and removed for
+    # non-fresh ones, so a caller cannot keep an older proof alive.
+    session.pop("_fresh_at", None)
+    session.pop("_fresh_level", None)
+    if fresh:
+        session["_fresh_at"] = current_app.login_manager.now()
+        session["_fresh_level"] = (
+            DEFAULT_AUTH_LEVEL if auth_level is None else auth_level
+        )
 
     if remember:
         session["_remember"] = "set"
@@ -215,6 +280,12 @@ def logout_user():
     if "_fresh" in session:
         session.pop("_fresh")
 
+    if "_fresh_at" in session:
+        session.pop("_fresh_at")
+
+    if "_fresh_level" in session:
+        session.pop("_fresh_level")
+
     if "_id" in session:
         session.pop("_id")
 
@@ -230,12 +301,31 @@ def logout_user():
     return True
 
 
-def confirm_login():
+def confirm_login(auth_level=None):
     """
     This sets the current session as fresh. Sessions become stale when they
     are reloaded from a cookie.
+
+    Call this only *after* the user has successfully re-authenticated. It
+    writes a brand new freshness proof stamped with the current time and the
+    given `auth_level` (an ``int``), or
+    :data:`~flask_login.DEFAULT_AUTH_LEVEL` when omitted. Because the proof
+    is written here, a failed re-authentication that does not reach this
+    function cannot refresh the previous proof.
+
+    :param auth_level: The strength of the authentication method used to
+        confirm the login, as an ``int``. Defaults to ``None``, which records
+        :data:`~flask_login.DEFAULT_AUTH_LEVEL`.
+    :type auth_level: int
     """
+    if auth_level is not None and not isinstance(auth_level, int):
+        raise TypeError("auth_level must be an int or None")
+
     session["_fresh"] = True
+    session["_fresh_at"] = current_app.login_manager.now()
+    session["_fresh_level"] = (
+        DEFAULT_AUTH_LEVEL if auth_level is None else auth_level
+    )
     session["_id"] = current_app.login_manager._session_identifier_generator()
     user_login_confirmed.send(current_app._get_current_object())
 
@@ -326,6 +416,100 @@ def fresh_login_required(func):
             return func(*args, **kwargs)
 
     return decorated_view
+
+
+def _evaluate_freshness(max_age, min_level):
+    """Evaluate the current freshness proof against a view's requirements.
+
+    Returns a :class:`~flask_login.ReauthReason` when re-authentication is
+    required, otherwise ``None``. The decision uses the session proof and the
+    view's declared requirements only; request parameters are never consulted.
+    """
+    fresh_at, level = _fresh_proof()
+
+    if fresh_at is None:
+        return ReauthReason.NOT_FRESH
+
+    if max_age is not None:
+        age = current_app.login_manager.now() - fresh_at
+        if age > max_age:
+            return ReauthReason.EXPIRED
+
+    if level < min_level:
+        return ReauthReason.WEAK_AUTH_LEVEL
+
+    return None
+
+
+def reauth_required(max_age=None, min_level=DEFAULT_AUTH_LEVEL):
+    """Decorate a view that requires a recent, sufficiently strong
+    re-authentication.
+
+    Unlike :func:`fresh_login_required`, each view declares its own
+    requirements, which are evaluated independently on every request even
+    when several views share the same session:
+
+    :param max_age: Maximum age allowed for the last fresh authentication.
+        Pass a :class:`~datetime.timedelta`; ``None`` means the age is not
+        checked. A negative or zero duration requires re-authentication on
+        every request.
+    :type max_age: datetime.timedelta
+    :param min_level: Minimum authentication method level required. The level
+        is the ``auth_level`` recorded by :func:`login_user` or
+        :func:`confirm_login`; the default is
+        :data:`~flask_login.DEFAULT_AUTH_LEVEL`.
+    :type min_level: int
+
+    Unauthenticated users are handled by
+    :meth:`~flask_login.LoginManager.unauthorized`. Authenticated users whose
+    proof is missing, too old, or too weak are handled by
+    :meth:`~flask_login.LoginManager.needs_refresh` with a
+    :class:`~flask_login.ReauthReason`, which also emits the
+    :data:`~flask_login.reauthentication_required` signal. The reason carries
+    no secrets.
+
+    The requirements are taken from these decorator arguments only. Values
+    sent in the request (query string, form fields, headers, JSON body) can
+    never raise the recorded level or extend the accepted age.
+
+    .. Note ::
+
+        Per `W3 guidelines for CORS preflight requests
+        <http://www.w3.org/TR/cors/#cross-origin-request-with-preflight-0>`_,
+        HTTP ``OPTIONS`` requests are exempt from these checks.
+    """
+    if max_age is not None and not isinstance(max_age, timedelta):
+        raise TypeError("max_age must be a datetime.timedelta or None")
+    if not isinstance(min_level, int):
+        raise TypeError("min_level must be an int")
+    if min_level < 0:
+        raise ValueError("min_level must be >= 0")
+
+    def decorator(func):
+        @wraps(func)
+        def decorated_view(*args, **kwargs):
+            if request.method in EXEMPT_METHODS:
+                pass
+            elif not current_user.is_authenticated:
+                return current_app.login_manager.unauthorized()
+            else:
+                reason = _evaluate_freshness(max_age, min_level)
+                if reason is not None:
+                    return current_app.login_manager.needs_refresh(reason)
+
+            # flask 1.x compatibility
+            # current_app.ensure_sync is only available in Flask >= 2.0
+            if callable(getattr(current_app, "ensure_sync", None)):
+                return current_app.ensure_sync(func)(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        # Expose the declared policy for introspection and tests. This is the
+        # only place the requirements live; nothing reads them from requests.
+        decorated_view.reauth_max_age = max_age
+        decorated_view.reauth_min_level = min_level
+        return decorated_view
+
+    return decorator
 
 
 def set_login_view(login_view, blueprint=None):

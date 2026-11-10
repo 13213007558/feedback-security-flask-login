@@ -39,6 +39,8 @@ SESSION_KEYS = {
     "_remember_seconds",
     "_id",
     "_fresh",
+    "_fresh_at",
+    "_fresh_level",
     "next",
 }
 

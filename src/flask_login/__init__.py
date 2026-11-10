@@ -10,6 +10,9 @@ from .config import REFRESH_MESSAGE_CATEGORY
 from .login_manager import LoginManager
 from .mixins import AnonymousUserMixin
 from .mixins import UserMixin
+from .reauth import DEFAULT_AUTH_LEVEL
+from .reauth import ReauthReason
+from .signals import reauthentication_required
 from .signals import session_protected
 from .signals import user_accessed
 from .signals import user_loaded_from_cookie
@@ -24,6 +27,8 @@ from .utils import confirm_login
 from .utils import current_user
 from .utils import decode_cookie
 from .utils import encode_cookie
+from .utils import fresh_auth_level
+from .utils import fresh_login_age
 from .utils import fresh_login_required
 from .utils import login_fresh
 from .utils import login_remembered
@@ -32,6 +37,7 @@ from .utils import login_url
 from .utils import login_user
 from .utils import logout_user
 from .utils import make_next_param
+from .utils import reauth_required
 from .utils import set_login_view
 
 __all__ = [
@@ -39,6 +45,7 @@ __all__ = [
     "COOKIE_HTTPONLY",
     "COOKIE_NAME",
     "COOKIE_SECURE",
+    "DEFAULT_AUTH_LEVEL",
     "ID_ATTRIBUTE",
     "LOGIN_MESSAGE",
     "LOGIN_MESSAGE_CATEGORY",
@@ -46,7 +53,9 @@ __all__ = [
     "REFRESH_MESSAGE_CATEGORY",
     "LoginManager",
     "AnonymousUserMixin",
+    "ReauthReason",
     "UserMixin",
+    "reauthentication_required",
     "session_protected",
     "user_accessed",
     "user_loaded_from_cookie",
@@ -61,6 +70,8 @@ __all__ = [
     "current_user",
     "decode_cookie",
     "encode_cookie",
+    "fresh_auth_level",
+    "fresh_login_age",
     "fresh_login_required",
     "login_fresh",
     "login_remembered",
@@ -69,6 +80,7 @@ __all__ = [
     "login_user",
     "logout_user",
     "make_next_param",
+    "reauth_required",
     "set_login_view",
 ]
 

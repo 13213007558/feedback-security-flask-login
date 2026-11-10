@@ -348,6 +348,102 @@ Or by providing your own callback to handle refreshing::
 
 To mark a session as fresh again, call the `confirm_login` function.
 
+Per-View Freshness And Authentication Levels
+============================================
+"Logged in recently" is not the same requirement for every view. Viewing a
+profile may tolerate a login from a few minutes ago, while changing a payout
+account can demand an authentication from the last minute *and* a strong
+method such as a hardware key. `reauth_required` lets each view declare both
+requirements independently::
+
+    from datetime import timedelta
+
+    from flask_login import reauth_required
+
+    @app.route("/profile")
+    @reauth_required(max_age=timedelta(minutes=5))
+    def profile():
+        ...
+
+    @app.route("/payout-account", methods=["POST"])
+    @reauth_required(max_age=timedelta(minutes=1), min_level=2)
+    def change_payout_account():
+        ...
+
+`max_age` is a `datetime.timedelta` bounding the age of the last fresh
+authentication (`None` disables the age check), and `min_level` is the minimum
+authentication method level accepted by the view. Several views may share one
+session; each one is judged against its own declaration on every request.
+Being allowed on one view never grants access to another with stricter
+requirements.
+
+Recording Authentication Evidence
+---------------------------------
+A fresh proof consists of a timestamp and an authentication level. Only a
+genuine fresh authentication can write it:
+
+- `login_user(..., fresh=True)` (the default) stamps the current time with the
+  given `auth_level`, or `DEFAULT_AUTH_LEVEL` (``0``) when omitted.
+- `login_user(..., fresh=False)` writes **no** proof, regardless of
+  `auth_level`.
+- Call `confirm_login(auth_level=...)` only *after* a successful
+  re-authentication. A failed attempt that never reaches this call cannot
+  refresh the previous proof.
+- A session restored from a "remember me" cookie is non-fresh and gets neither
+  a new timestamp nor a level. The user must re-authenticate for real.
+- `logout_user` removes the proof, and session protection removes it when it
+  marks a session stale.
+
+The requirements live on the decorator and are evaluated against the server
+session only. Query strings, form fields, headers, or JSON bodies can never
+self-declare a level or extend the accepted age.
+
+Handling Rejections
+-------------------
+Unauthenticated users are handled by `LoginManager.unauthorized` as usual.
+Authenticated users whose proof is missing, too old, or based on a method that
+is too weak are sent to `LoginManager.needs_refresh` with a `ReauthReason`
+(`not_fresh`, `expired`, or `weak_auth_level`). Register a dedicated callback
+to receive that reason; the reason describes the policy decision and never
+contains credentials::
+
+    @login_manager.reauth_handler
+    def on_reauth(reason):
+        return render_template("reauth.html", reason=reason.value), 403
+
+The `reauthentication_required` signal is emitted with the same reason. When no
+`reauth_handler` is registered, requests fall back to the standard
+`needs_refresh_handler` / `refresh_view` behavior, so `fresh_login_required`
+keeps working exactly as before.
+
+Resuming The Original Action
+----------------------------
+A typical flow redirects the user to a re-authentication form, then continues
+the restricted operation they originally requested::
+
+    from flask import session, redirect, url_for
+    from flask_login import confirm_login, reauth_required
+
+    @app.route("/reauth", methods=["POST"])
+    def reauth():
+        if not verify_hardware_key():
+            # Do not call confirm_login: the old proof stays untouched.
+            return "Invalid credentials", 401
+        confirm_login(auth_level=2)
+        return redirect(session.pop("next", url_for("index")))
+
+    @app.route("/payout-account", methods=["POST"])
+    @reauth_required(max_age=timedelta(minutes=1), min_level=2)
+    def change_payout_account():
+        # Reached only with a fresh, sufficiently strong authentication.
+        ...
+
+The same protection applies to synchronous and asynchronous (``async def``)
+views; both run through the identical check before the view body executes.
+
+Tests can pin the clock by assigning a zero-argument callable returning a
+timezone-aware UTC datetime to ``login_manager._now``.
+
 
 Cookie Settings
 ===============
@@ -559,6 +655,8 @@ Configuring Login
 
    .. automethod:: needs_refresh_handler
 
+   .. automethod:: reauth_handler
+
 
 Login Mechanisms
 ----------------
@@ -567,6 +665,10 @@ Login Mechanisms
    A proxy for the current user.
 
 .. autofunction:: login_fresh
+
+.. autofunction:: fresh_login_age
+
+.. autofunction:: fresh_auth_level
 
 .. autofunction:: login_remembered
 
@@ -582,6 +684,16 @@ Protecting Views
 .. autofunction:: login_required
 
 .. autofunction:: fresh_login_required
+
+.. autofunction:: reauth_required
+
+.. autoclass:: ReauthReason
+   :members:
+
+.. data:: DEFAULT_AUTH_LEVEL
+
+   The method level recorded by a fresh login or confirmation without an
+   explicit level.
 
 
 User Object Helpers
@@ -630,6 +742,13 @@ signals in your code.
 
    Sent when the `needs_refresh` method is called on a `LoginManager`. It
    receives no additional arguments besides the app.
+
+.. data:: reauthentication_required
+
+   Sent when a view protected with `reauth_required` rejects an authenticated
+   user. Besides the app, it receives a `reason` keyword argument holding a
+   `ReauthReason` (`not_fresh`, `expired`, or `weak_auth_level`). The reason
+   never contains credentials or other secrets.
 
 .. data:: session_protected
 
