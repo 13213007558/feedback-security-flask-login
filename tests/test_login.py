@@ -41,8 +41,18 @@ from flask_login import user_login_confirmed
 from flask_login import user_needs_refresh
 from flask_login import user_unauthorized
 from flask_login import UserMixin
+from flask_login.utils import _encode_remember_cookie
+from flask_login.utils import _parse_remember_cookie
 from flask_login.utils import _secret_key
 from flask_login.utils import _user_context_processor
+
+
+@contextmanager
+def clock_at(moment):
+    """Patch the clock used by the login manager to return a fixed time."""
+    with patch("flask_login.login_manager.datetime") as mock_dt:
+        mock_dt.now = Mock(return_value=moment)
+        yield mock_dt
 
 
 @contextmanager
@@ -1127,6 +1137,292 @@ class LoginTestCase(unittest.TestCase):
         with self.app.test_request_context():
             _ucp = self.app.context_processor(_user_context_processor)
             self.assertIsInstance(_ucp()["current_user"], AnonymousUserMixin)
+
+
+class RememberCookieLifetimeTestCase(unittest.TestCase):
+    """Tests for the versioned remember cookie format with server-side
+    validation of issuance time and absolute expiry."""
+
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config["SECRET_KEY"] = "deterministic"
+        self.app.config["SESSION_PROTECTION"] = None
+        self.remember_cookie_name = "remember"
+        self.app.config["REMEMBER_COOKIE_NAME"] = self.remember_cookie_name
+        self.app.config["REMEMBER_COOKIE_DURATION"] = timedelta(hours=1)
+        self.login_manager = LoginManager()
+        self.login_manager.init_app(self.app)
+        self.user_loader_calls = []
+
+        @self.app.route("/login-notch")
+        def login_notch():
+            return str(login_user(notch))
+
+        @self.app.route("/login-notch-remember")
+        def login_notch_remember():
+            return str(login_user(notch, remember=True))
+
+        @self.app.route("/username")
+        def username():
+            if current_user.is_authenticated:
+                return current_user.name
+            return "Anonymous"
+
+        @self.app.route("/is-fresh")
+        def is_fresh():
+            return str(login_fresh())
+
+        @self.app.route("/is-remembered")
+        def is_remembered():
+            return str(login_remembered())
+
+        @self.app.route("/confirm-login")
+        def _confirm_login():
+            confirm_login()
+            return ""
+
+        @self.app.route("/logout")
+        def logout():
+            return str(logout_user())
+
+        @self.login_manager.user_loader
+        def load_user(user_id):
+            self.user_loader_calls.append(user_id)
+            return USERS[int(user_id)]
+
+        @self.app.errorhandler(404)
+        def handle_404(e):
+            raise e
+
+        unittest.TestCase.setUp(self)
+
+    def _delete_session(self, c):
+        # Helper method to cause the session to be deleted
+        # as if the browser was closed.
+        with c.session_transaction() as sess:
+            sess.clear()
+
+    def _get_cookie(self, c):
+        return c.get_cookie(self.remember_cookie_name, "localhost", "/")
+
+    def _set_cookie(self, c, value):
+        # Present a cookie value to the server directly, regardless of any
+        # browser-side expiry the test client may have recorded for it.
+        c.set_cookie(self.remember_cookie_name, value, domain="localhost")
+
+    def _parse(self, value):
+        parsed = _parse_remember_cookie(value, key="deterministic")
+        self.assertIsNotNone(parsed)
+        return parsed
+
+    def test_login_restore_refresh_and_absolute_expiry(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.app.config["REMEMBER_COOKIE_REFRESH_EACH_REQUEST"] = True
+        c = self.app.test_client()
+
+        # Log in: a versioned cookie is issued with the issuance time and
+        # absolute expiry embedded and signed with the test key.
+        with clock_at(t0):
+            c.get("/login-notch-remember")
+        cookie = self._get_cookie(c)
+        self.assertIsNotNone(cookie)
+        user_id, issued_at, expires = self._parse(cookie.value)
+        self.assertEqual("1", user_id)
+        self.assertEqual(int(t0.timestamp()), issued_at)
+        self.assertEqual(int((t0 + timedelta(hours=1)).timestamp()), expires)
+
+        # Close the browser (drop the session); the remember cookie
+        # restores the user, and the restored login is not fresh.
+        self._delete_session(c)
+        with clock_at(t0 + timedelta(minutes=10)):
+            self.assertEqual("Notch", c.get("/username").data.decode("utf-8"))
+            self.assertEqual("False", c.get("/is-fresh").data.decode("utf-8"))
+            self.assertEqual("True", c.get("/is-remembered").data.decode("utf-8"))
+
+        # Sliding refresh re-issues the cookie with a later browser expiry,
+        # but the signed credential keeps its original absolute lifetime.
+        self._delete_session(c)
+        with clock_at(t0 + timedelta(minutes=20)):
+            c.get("/username")
+        refreshed = self._get_cookie(c)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(cookie.value, refreshed.value)
+        self.assertGreater(refreshed.expires, cookie.expires)
+
+        # Past the absolute expiry the server rejects the credential before
+        # calling user_loader, even though the browser would still present
+        # it (its expiry was slid forward by the refresh).
+        self._delete_session(c)
+        self._set_cookie(c, refreshed.value)
+        self.user_loader_calls.clear()
+        with clock_at(t0 + timedelta(hours=2)):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+            self.assertEqual("False", c.get("/is-remembered").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_restore_is_unfresh_until_login_confirmed(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        c = self.app.test_client()
+        with clock_at(t0):
+            c.get("/login-notch-remember")
+            self.assertEqual("True", c.get("/is-fresh").data.decode("utf-8"))
+
+        self._delete_session(c)
+        with clock_at(t0 + timedelta(minutes=5)):
+            self.assertEqual("False", c.get("/is-fresh").data.decode("utf-8"))
+            c.get("/confirm-login")
+            self.assertEqual("True", c.get("/is-fresh").data.decode("utf-8"))
+
+    def test_future_issued_at_rejected(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        value = _encode_remember_cookie(
+            "1",
+            (t0 + timedelta(hours=1)).timestamp(),
+            (t0 + timedelta(hours=2)).timestamp(),
+            key="deterministic",
+        )
+        c = self.app.test_client()
+        self._set_cookie(c, value)
+        with clock_at(t0):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_corrupt_time_fields_rejected(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        bad_payloads = [
+            "v2|not-a-time|123|1",
+            "v2|123|not-a-time|1",
+            "v2|123",
+            "v2|123|456",
+        ]
+        for payload in bad_payloads:
+            c = self.app.test_client()
+            self._set_cookie(c, encode_cookie(payload, key="deterministic"))
+            with clock_at(t0):
+                self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_expired_cookie_rejected(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        value = _encode_remember_cookie(
+            "1",
+            (t0 - timedelta(hours=2)).timestamp(),
+            (t0 - timedelta(hours=1)).timestamp(),
+            key="deterministic",
+        )
+        c = self.app.test_client()
+        self._set_cookie(c, value)
+        with clock_at(t0):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_expired_cookie_not_revived_by_refresh(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.app.config["REMEMBER_COOKIE_REFRESH_EACH_REQUEST"] = True
+        c = self.app.test_client()
+        with clock_at(t0):
+            c.get("/login-notch")
+
+        expired = _encode_remember_cookie(
+            "1",
+            (t0 - timedelta(hours=2)).timestamp(),
+            (t0 - timedelta(hours=1)).timestamp(),
+            key="deterministic",
+        )
+        self._set_cookie(c, expired)
+        with clock_at(t0):
+            result = c.get("/username")
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+        set_cookies = result.headers.getlist("Set-Cookie")
+        self.assertFalse(any(sc.startswith("remember=") for sc in set_cookies))
+
+    def test_legacy_cookie_rejected_without_migration_deadline(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        c = self.app.test_client()
+        self._set_cookie(c, encode_cookie("1", key="deterministic"))
+        with clock_at(t0):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+            self.assertEqual("False", c.get("/is-remembered").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_legacy_cookie_accepted_until_migration_deadline(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        until = t0 + timedelta(days=30)
+        self.app.config["REMEMBER_COOKIE_LEGACY_UNTIL"] = until
+        legacy = encode_cookie("1", key="deterministic")
+        c = self.app.test_client()
+        self._set_cookie(c, legacy)
+
+        with clock_at(t0 + timedelta(days=29)):
+            self.assertEqual("Notch", c.get("/username").data.decode("utf-8"))
+            self.assertEqual("False", c.get("/is-fresh").data.decode("utf-8"))
+            self.assertEqual("True", c.get("/is-remembered").data.decode("utf-8"))
+
+        # Once the deadline has passed the same cookie is rejected, even
+        # though its signature is still valid.
+        self._delete_session(c)
+        self._set_cookie(c, legacy)
+        self.user_loader_calls.clear()
+        with clock_at(t0 + timedelta(days=31)):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+        self.assertEqual([], self.user_loader_calls)
+
+    def test_legacy_refresh_capped_at_migration_deadline(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        until = t0 + timedelta(hours=2)
+        self.app.config["REMEMBER_COOKIE_LEGACY_UNTIL"] = until
+        self.app.config["REMEMBER_COOKIE_REFRESH_EACH_REQUEST"] = True
+        self.app.config["REMEMBER_COOKIE_DURATION"] = timedelta(days=10)
+        legacy = encode_cookie("1", key="deterministic")
+        c = self.app.test_client()
+        self._set_cookie(c, legacy)
+
+        with clock_at(t0):
+            self.assertEqual("Notch", c.get("/username").data.decode("utf-8"))
+
+        # The refreshed cookie uses the new format, but its absolute expiry
+        # is capped at the migration deadline rather than the full duration.
+        cookie = self._get_cookie(c)
+        self.assertIsNotNone(cookie)
+        user_id, issued_at, expires = self._parse(cookie.value)
+        self.assertEqual("1", user_id)
+        self.assertEqual(int(t0.timestamp()), issued_at)
+        self.assertEqual(int(until.timestamp()), expires)
+
+        # The replacement credential dies at the migration deadline too.
+        self._delete_session(c)
+        self._set_cookie(c, cookie.value)
+        with clock_at(until + timedelta(seconds=1)):
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+
+    def test_legacy_cookie_not_refreshed_after_deadline(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        until = t0 + timedelta(hours=1)
+        self.app.config["REMEMBER_COOKIE_LEGACY_UNTIL"] = until
+        self.app.config["REMEMBER_COOKIE_REFRESH_EACH_REQUEST"] = True
+        c = self.app.test_client()
+        with clock_at(t0):
+            c.get("/login-notch")
+
+        legacy = encode_cookie("1", key="deterministic")
+        self._set_cookie(c, legacy)
+        with clock_at(until + timedelta(seconds=1)):
+            result = c.get("/username")
+            # The plain session is still valid, but the stale legacy cookie
+            # must not be refreshed into a new credential.
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+        set_cookies = result.headers.getlist("Set-Cookie")
+        self.assertFalse(any(sc.startswith("remember=") for sc in set_cookies))
+
+    def test_logout_clears_versioned_cookie(self):
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        c = self.app.test_client()
+        with clock_at(t0):
+            c.get("/login-notch-remember")
+            result = c.get("/logout")
+            self.assertEqual("Anonymous", c.get("/username").data.decode("utf-8"))
+        set_cookies = result.headers.getlist("Set-Cookie")
+        self.assertTrue(any(sc.startswith("remember=") and "1970" in sc for sc in set_cookies))
 
 
 class LoginViaRequestTestCase(unittest.TestCase):

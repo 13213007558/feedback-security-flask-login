@@ -18,6 +18,12 @@ Unreleased
 - Never look at the `X-Forwarded-For` header, always use `request.remote_addr`,
   requiring the developer to configure `ProxyFix` appropriately. #700
 - Remove `LOGIN_DISABLED` config. #697
+- Issue "remember me" cookies in a versioned format that embeds the issuance
+  time and an absolute expiry. The server verifies both timestamps before
+  calling `user_loader`, rejects over-age, future-dated, or malformed
+  credentials, and never extends the original absolute lifetime when
+  refreshing the cookie. Legacy cookies without timestamps are only accepted
+  until the new `REMEMBER_COOKIE_LEGACY_UNTIL` migration deadline.
 
 
 Version 0.6.3

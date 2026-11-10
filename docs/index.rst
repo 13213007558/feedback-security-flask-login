@@ -289,6 +289,34 @@ The cookie is tamper-proof, so if the user tampers with it (i.e.
 inserts someone else's user ID in place of their own), the cookie will merely
 be rejected, as if it was not there.
 
+The cookie is issued in a versioned format that embeds the issuance time and
+an absolute expiry alongside the user ID. The server verifies both
+timestamps *before* calling your `user_loader` callback, and rejects
+credentials that are past their absolute expiry, claim an issuance time in
+the future, or carry malformed time fields. Because the absolute expiry is
+part of the signed credential, refreshing the cookie (via
+`REMEMBER_COOKIE_REFRESH_EACH_REQUEST`) only slides the browser-side
+expiration; it can never push the original absolute lifetime further into
+the future.
+
+Cookies issued by older versions of Flask-Login do not carry timestamps, so
+their age cannot be verified. They are rejected by default. To migrate
+without logging everyone out, configure a deadline until which legacy
+cookies are still accepted::
+
+    # Phase 1: switchover. New logins get versioned cookies; legacy cookies
+    # keep working until the deadline. Legacy cookies refreshed during the
+    # window are replaced by versioned ones capped at the same deadline.
+    app.config["REMEMBER_COOKIE_LEGACY_UNTIL"] = datetime(
+        2026, 12, 1, tzinfo=timezone.utc
+    )
+
+Once the deadline has passed, end the compatibility period by removing the
+setting (or setting it to a time in the past)::
+
+    # Phase 2: compatibility over. Legacy cookies are rejected.
+    app.config.pop("REMEMBER_COOKIE_LEGACY_UNTIL", None)
+
 That level of functionality is handled automatically. However, you can (and
 should, if your application handles any kind of sensitive data) provide
 additional infrastructure to increase the security of your remember cookies.
@@ -374,11 +402,20 @@ The details of the cookie can be customized in the application settings.
                                        **Default:** `True`
 `REMEMBER_COOKIE_REFRESH_EACH_REQUEST` If set to `True` the cookie is refreshed on every
                                        request, which bumps the lifetime. Works like
-                                       Flask's `SESSION_REFRESH_EACH_REQUEST`.
+                                       Flask's `SESSION_REFRESH_EACH_REQUEST`. The
+                                       absolute expiry embedded in the cookie is never
+                                       extended by a refresh.
                                        **Default:** `False`
 `REMEMBER_COOKIE_SAMESITE`             Restricts the "Remember Me" cookie to first-party
                                        or same-site context.
                                        **Default:** `None`
+`REMEMBER_COOKIE_LEGACY_UNTIL`         A `datetime.datetime` or Unix timestamp until
+                                       which legacy "remember me" cookies without
+                                       embedded timestamps are still accepted. Legacy
+                                       cookies refreshed during this window are
+                                       replaced by versioned ones that expire no later
+                                       than the deadline. **Default:** `None` (legacy
+                                       cookies are rejected)
 ====================================== =================================================
 
 

@@ -6,6 +6,11 @@ COOKIE_NAME = "remember_token"
 #: The default time before the "remember me" cookie expires (365 days).
 COOKIE_DURATION = timedelta(days=365)
 
+#: The default deadline until which legacy-format "remember me" cookies
+#: (without issuance and expiry timestamps) are still accepted. ``None``
+#: means legacy cookies are rejected.
+COOKIE_LEGACY_UNTIL = None
+
 #: Whether the "remember me" cookie requires Secure; defaults to ``False``
 COOKIE_SECURE = False
 

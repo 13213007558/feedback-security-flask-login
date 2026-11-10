@@ -12,6 +12,7 @@ from flask import session
 
 from .config import COOKIE_DURATION
 from .config import COOKIE_HTTPONLY
+from .config import COOKIE_LEGACY_UNTIL
 from .config import COOKIE_NAME
 from .config import COOKIE_SAMESITE
 from .config import COOKIE_SECURE
@@ -30,12 +31,32 @@ from .signals import user_loaded_from_request
 from .signals import user_needs_refresh
 from .signals import user_unauthorized
 from .utils import _create_identifier
+from .utils import _encode_remember_cookie
+from .utils import _parse_remember_cookie
 from .utils import _user_context_processor
-from .utils import decode_cookie
-from .utils import encode_cookie
 from .utils import expand_login_view
 from .utils import login_url as make_login_url
 from .utils import make_next_param
+
+
+def _legacy_until_timestamp(value):
+    """Normalizes the ``REMEMBER_COOKIE_LEGACY_UNTIL`` config value to a
+    Unix timestamp, or ``None`` if no migration deadline is configured."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if hasattr(value, "timestamp"):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+
+    raise Exception(
+        "REMEMBER_COOKIE_LEGACY_UNTIL must be a datetime or Unix timestamp, "
+        f"instead got: {value}"
+    )
 
 
 class LoginManager:
@@ -364,7 +385,7 @@ class LoginManager:
         return False
 
     def _load_user_from_remember_cookie(self, cookie):
-        user_id = decode_cookie(cookie)
+        user_id = self._validate_remember_cookie(cookie)
         if user_id is not None:
             session["_user_id"] = user_id
             session["_fresh"] = False
@@ -376,6 +397,43 @@ class LoginManager:
                 user_loaded_from_cookie.send(app, user=user)
                 return user
         return None
+
+    def _validate_remember_cookie(self, cookie):
+        """Returns the user ID carried by a "remember me" cookie if it is
+        authentic and within its absolute lifetime, otherwise ``None``. All
+        time checks happen here, before any ``user_loader`` callback runs."""
+        parsed = _parse_remember_cookie(cookie)
+        if parsed is None:
+            return None
+
+        user_id, issued_at, expires = parsed
+        if not self._remember_cookie_times_valid(issued_at, expires):
+            return None
+
+        return user_id
+
+    def _remember_cookie_times_valid(self, issued_at, expires):
+        now = datetime.now(timezone.utc).timestamp()
+
+        if issued_at is None or expires is None:
+            # Legacy cookies carry no timestamps, so their age cannot be
+            # verified. They are only accepted during a configured migration
+            # window, never indefinitely.
+            until = _legacy_until_timestamp(
+                current_app.config.get("REMEMBER_COOKIE_LEGACY_UNTIL", COOKIE_LEGACY_UNTIL)
+            )
+            return until is not None and now < until
+
+        if issued_at > now:
+            # Issued in the future; reject explicitly.
+            return False
+
+        if expires <= now:
+            # The absolute lifetime has elapsed; reject regardless of what
+            # the browser-side expiry says.
+            return False
+
+        return True
 
     def _load_user_from_request(self, request):
         if self._request_callback:
@@ -398,13 +456,14 @@ class LoginManager:
 
         if operation == "clear":
             self._clear_cookie(response)
-
-        if operation == "set" or refresh:
+        elif operation == "set":
             self._set_cookie(response)
+        elif refresh:
+            self._set_cookie(response, refresh=True)
 
         return response
 
-    def _set_cookie(self, response):
+    def _set_cookie(self, response, refresh=False):
         if "_user_id" not in session:
             return
 
@@ -423,18 +482,45 @@ class LoginManager:
         else:
             duration = config.get("REMEMBER_COOKIE_DURATION", COOKIE_DURATION)
 
-        # prepare data
-        data = encode_cookie(str(session["_user_id"]))
-
         if isinstance(duration, int):
             duration = timedelta(seconds=duration)
 
         try:
-            expires = datetime.now(timezone.utc) + duration
+            now = datetime.now(timezone.utc)
+            expires = now + duration
         except TypeError as e:
             raise Exception(
                 f"REMEMBER_COOKIE_DURATION must be a datetime.timedelta, instead got: {duration}"
             ) from e
+
+        issued_at = now.timestamp()
+        absolute_expires = expires.timestamp()
+
+        if refresh and cookie_name in request.cookies:
+            # A refresh must not push the original absolute lifetime of the
+            # credential further into the future.
+            parsed = _parse_remember_cookie(request.cookies[cookie_name])
+            if parsed is not None:
+                _, old_issued_at, old_expires = parsed
+                if old_issued_at is None:
+                    # Legacy cookie: it may only be refreshed within the
+                    # migration window, and the replacement credential must
+                    # not outlive the migration deadline.
+                    until = _legacy_until_timestamp(
+                        config.get("REMEMBER_COOKIE_LEGACY_UNTIL", COOKIE_LEGACY_UNTIL)
+                    )
+                    if until is None or now.timestamp() >= until:
+                        return
+                    absolute_expires = min(absolute_expires, until)
+                else:
+                    if old_expires <= now.timestamp():
+                        # Over-age credential; do not revive it.
+                        return
+                    issued_at = old_issued_at
+                    absolute_expires = old_expires
+
+        # prepare data
+        data = _encode_remember_cookie(str(session["_user_id"]), issued_at, absolute_expires)
 
         # actually set it
         response.set_cookie(

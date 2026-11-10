@@ -24,6 +24,10 @@ from .signals import user_login_confirmed
 #: anonymous user
 current_user = LocalProxy(lambda: _get_user())
 
+#: Version prefix for "remember me" cookies that carry their issuance time
+#: and absolute expiry alongside the user ID.
+REMEMBER_COOKIE_VERSION = "v2"
+
 
 def encode_cookie(payload, key=None):
     """
@@ -61,6 +65,56 @@ def decode_cookie(cookie, key=None):
 
     if hmac.compare_digest(_cookie_digest(payload, key=key), digest):
         return payload
+
+
+def _encode_remember_cookie(user_id, issued_at, expires, key=None):
+    """
+    Encodes a "remember me" cookie in the versioned format, embedding the
+    issuance time and absolute expiry (both as Unix timestamps) alongside
+    the user ID, and signs it with the app's secret key.
+
+    :param user_id: The user ID to encode, as `str`.
+    :param issued_at: When the credential was issued, as a Unix timestamp.
+    :param expires: The absolute expiry of the credential, as a Unix
+        timestamp. Refreshing the cookie must never move this further out.
+    :param key: The key to use when creating the cookie digest. If not
+                specified, the SECRET_KEY value from app config will be used.
+    """
+    payload = f"{REMEMBER_COOKIE_VERSION}|{int(issued_at)}|{int(expires)}|{user_id}"
+    return encode_cookie(payload, key=key)
+
+
+def _parse_remember_cookie(cookie, key=None):
+    """
+    Decodes and verifies a "remember me" cookie. Returns a tuple of
+    ``(user_id, issued_at, expires)``. For versioned cookies ``issued_at``
+    and ``expires`` are integer Unix timestamps; for legacy cookies without
+    embedded times they are ``None``. Returns ``None`` if the signature is
+    invalid or embedded time fields are malformed.
+
+    :param cookie: An encoded cookie.
+    :type cookie: str
+
+    :param key: The key to use when creating the cookie digest. If not
+                specified, the SECRET_KEY value from app config will be used.
+    :type key: str
+    """
+    payload = decode_cookie(cookie, key=key)
+    if payload is None:
+        return None
+
+    if payload.startswith(f"{REMEMBER_COOKIE_VERSION}|"):
+        parts = payload.split("|", 3)
+        if len(parts) != 4:
+            return None
+        try:
+            issued_at = int(parts[1])
+            expires = int(parts[2])
+        except ValueError:
+            return None
+        return parts[3], issued_at, expires
+
+    return payload, None, None
 
 
 def make_next_param(login_url, current_url):
@@ -146,8 +200,8 @@ def login_remembered():
     has_cookie = cookie_name in request.cookies and session.get("_remember") != "clear"
     if has_cookie:
         cookie = request.cookies[cookie_name]
-        user_id = decode_cookie(cookie)
-        return user_id is not None
+        manager = current_app.login_manager
+        return manager._validate_remember_cookie(cookie) is not None
     return False
 
 
