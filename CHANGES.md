@@ -18,6 +18,14 @@ Unreleased
 - Never look at the `X-Forwarded-For` header, always use `request.remote_addr`,
   requiring the developer to configure `ProxyFix` appropriately. #700
 - Remove `LOGIN_DISABLED` config. #697
+- `user_loader`, `request_loader`, `unauthorized_handler`,
+  `needs_refresh_handler` and the new `anonymous_user_loader` accept an
+  `app` argument so callbacks and the anonymous user factory can be
+  registered per application on a shared `LoginManager`. The active
+  callbacks are selected from the current app context and stored in
+  `app.extensions["login_manager"]`; registrations without an `app`
+  remain instance defaults and keep their previous behavior. Repeated
+  `init_app` calls no longer reset an app's configuration.
 
 
 Version 0.6.3

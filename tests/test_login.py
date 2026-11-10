@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from flask import Blueprint
+from flask import current_app
 from flask import Flask
 from flask import get_flashed_messages
 from flask import Response
@@ -1623,3 +1624,305 @@ class CustomTestClientTestCase(unittest.TestCase):
             self.assertEqual("Anonymous", username.data.decode("utf-8"))
             is_fresh = c.get("/is-fresh")
             self.assertEqual("False", is_fresh.data.decode("utf-8"))
+
+
+class MultiAppTestCase(unittest.TestCase):
+    """One LoginManager shared by two applications must keep every
+    application-specific callback and user object isolated."""
+
+    def setUp(self):
+        self.login_manager = LoginManager()
+        self.app_a = Flask("app_a")
+        self.app_b = Flask("app_b")
+        self.app_a.config["SECRET_KEY"] = "deterministic"
+        self.app_b.config["SECRET_KEY"] = "deterministic"
+        self.login_manager.init_app(self.app_a)
+        self.login_manager.init_app(self.app_b)
+        self.app_a.response_class.autocorrect_location_header = False
+        self.app_b.response_class.autocorrect_location_header = False
+
+        # Distinct user models: the same id resolves to a different object in
+        # each application.
+        self.user_a = User("Alice", "same-id")
+        self.user_b = User("Bob", "same-id")
+
+        @self.login_manager.user_loader(app=self.app_a)
+        def load_user_a(user_id):
+            if user_id == self.user_a.get_id():
+                return self.user_a
+            return None
+
+        @self.login_manager.user_loader(app=self.app_b)
+        def load_user_b(user_id):
+            if user_id == self.user_b.get_id():
+                return self.user_b
+            return None
+
+        self.load_user_a = load_user_a
+        self.load_user_b = load_user_b
+
+        def username():
+            if current_user.is_authenticated:
+                return current_user.name
+            return "Anonymous"
+
+        self.app_a.add_url_rule("/username", "username", username)
+        self.app_b.add_url_rule("/username", "username", username)
+
+    def _login_session(self, app):
+        client = app.test_client()
+        with client.session_transaction() as sess:
+            sess["_user_id"] = "same-id"
+            sess["_fresh"] = True
+        return client
+
+    def test_same_id_loads_different_user_per_app(self):
+        client_a = self._login_session(self.app_a)
+        client_b = self._login_session(self.app_b)
+
+        self.assertEqual("Alice", client_a.get("/username").data.decode())
+        self.assertEqual("Bob", client_b.get("/username").data.decode())
+        # Interleave the requests: neither app may borrow the other's loader.
+        self.assertEqual("Bob", client_b.get("/username").data.decode())
+        self.assertEqual("Alice", client_a.get("/username").data.decode())
+
+    def test_user_loaded_signal_sender_is_current_app(self):
+        def login_a():
+            login_user(self.user_a, remember=True)
+            return ""
+
+        def login_b():
+            login_user(self.user_b, remember=True)
+            return ""
+
+        self.app_a.add_url_rule("/login", "login", login_a)
+        self.app_b.add_url_rule("/login", "login", login_b)
+
+        client_a = self.app_a.test_client()
+        client_b = self.app_b.test_client()
+        client_a.get("/login")
+        client_b.get("/login")
+        # Drop the session so the user is restored from the remember cookie.
+        with client_a.session_transaction() as sess:
+            sess.clear()
+        with client_b.session_transaction() as sess:
+            sess.clear()
+
+        with listen_to(user_loaded_from_cookie) as listener:
+            client_a.get("/username")
+            client_b.get("/username")
+
+        self.assertEqual(2, len(listener.heard))
+        self.assertIs(listener.heard[0][0][0], self.app_a)
+        self.assertIs(listener.heard[1][0][0], self.app_b)
+        self.assertIs(listener.heard[0][1]["user"], self.user_a)
+        self.assertIs(listener.heard[1][1]["user"], self.user_b)
+
+    def test_user_accessed_signal_sender_is_current_app(self):
+        client_a = self._login_session(self.app_a)
+        client_b = self._login_session(self.app_b)
+
+        with listen_to(user_accessed) as listener:
+            client_a.get("/username")
+            client_b.get("/username")
+
+        self.assertEqual(2, len(listener.heard))
+        self.assertIs(listener.heard[0][0][0], self.app_a)
+        self.assertIs(listener.heard[1][0][0], self.app_b)
+
+    def test_unauthorized_handler_is_selected_per_app(self):
+        def secret():
+            return current_app.login_manager.unauthorized()
+
+        self.app_a.add_url_rule("/secret", "secret", secret)
+        self.app_b.add_url_rule("/secret", "secret", secret)
+
+        @self.login_manager.unauthorized_handler(app=self.app_a)
+        def unauthorized_a():
+            return Response("app-a login required", 401)
+
+        @self.login_manager.unauthorized_handler(app=self.app_b)
+        def unauthorized_b():
+            return Response("app-b login required", 403)
+
+        response_a = self.app_a.test_client().get("/secret")
+        response_b = self.app_b.test_client().get("/secret")
+
+        self.assertEqual(401, response_a.status_code)
+        self.assertEqual("app-a login required", response_a.data.decode())
+        self.assertEqual(403, response_b.status_code)
+        self.assertEqual("app-b login required", response_b.data.decode())
+
+    def test_unauthorized_signal_sender_is_current_app(self):
+        def secret():
+            return current_app.login_manager.unauthorized()
+
+        self.app_a.add_url_rule("/secret", "secret", secret)
+        self.app_b.add_url_rule("/secret", "secret", secret)
+
+        with listen_to(user_unauthorized) as listener:
+            self.app_a.test_client().get("/secret")
+            self.app_b.test_client().get("/secret")
+
+        self.assertEqual(2, len(listener.heard))
+        self.assertIs(listener.heard[0][0][0], self.app_a)
+        self.assertIs(listener.heard[1][0][0], self.app_b)
+
+    def test_needs_refresh_handler_is_selected_per_app(self):
+        def stale():
+            return current_app.login_manager.needs_refresh()
+
+        self.app_a.add_url_rule("/stale", "stale", stale)
+        self.app_b.add_url_rule("/stale", "stale", stale)
+
+        @self.login_manager.needs_refresh_handler(app=self.app_a)
+        def refresh_a():
+            return Response("app-a refresh", 401)
+
+        @self.login_manager.needs_refresh_handler(app=self.app_b)
+        def refresh_b():
+            return Response("app-b refresh", 440)
+
+        response_a = self.app_a.test_client().get("/stale")
+        response_b = self.app_b.test_client().get("/stale")
+
+        self.assertEqual((401, "app-a refresh"), (response_a.status_code, response_a.data.decode()))
+        self.assertEqual((440, "app-b refresh"), (response_b.status_code, response_b.data.decode()))
+
+        with listen_to(user_needs_refresh) as listener:
+            self.app_b.test_client().get("/stale")
+        self.assertIs(listener.heard[0][0][0], self.app_b)
+
+    def test_anonymous_user_is_selected_per_app(self):
+        class AnonymousA(AnonymousUserMixin):
+            origin = "app-a"
+
+        class AnonymousB(AnonymousUserMixin):
+            origin = "app-b"
+
+        self.login_manager.anonymous_user_loader(AnonymousA, app=self.app_a)
+        self.login_manager.anonymous_user_loader(AnonymousB, app=self.app_b)
+
+        with self.app_a.test_request_context():
+            self.assertIsInstance(current_user._get_current_object(), AnonymousA)
+        with self.app_b.test_request_context():
+            self.assertIsInstance(current_user._get_current_object(), AnonymousB)
+
+    def test_request_loader_is_selected_per_app(self):
+        @self.login_manager.request_loader(app=self.app_a)
+        def request_a(request):
+            if request.headers.get("X-Token") == "a":
+                return self.user_a
+            return None
+
+        @self.login_manager.request_loader(app=self.app_b)
+        def request_b(request):
+            if request.headers.get("X-Token") == "b":
+                return self.user_b
+            return None
+
+        client_a = self.app_a.test_client()
+        client_b = self.app_b.test_client()
+
+        self.assertEqual(
+            "Alice", client_a.get("/username", headers={"X-Token": "a"}).data.decode()
+        )
+        self.assertEqual(
+            "Bob", client_b.get("/username", headers={"X-Token": "b"}).data.decode()
+        )
+        # The other app's token must not be accepted here.
+        self.assertEqual(
+            "Anonymous", client_a.get("/username", headers={"X-Token": "b"}).data.decode()
+        )
+        self.assertEqual(
+            "Anonymous", client_b.get("/username", headers={"X-Token": "a"}).data.decode()
+        )
+
+    def test_app_without_loader_raises(self):
+        bare_app = Flask("bare")
+        bare_app.config["SECRET_KEY"] = "deterministic"
+        self.login_manager.init_app(bare_app)
+
+        with bare_app.test_request_context():
+            session["_user_id"] = "same-id"
+            with self.assertRaises(Exception) as cm:
+                self.login_manager._load_user()
+            self.assertTrue(
+                str(cm.exception).startswith("Missing user_loader or request_loader")
+            )
+
+    def test_repeated_init_app_preserves_app_configuration(self):
+        self.login_manager.init_app(self.app_a)
+        self.login_manager.init_app(self.app_a)
+
+        self.assertIs(
+            self.app_a.extensions["login_manager"].user_callback, self.load_user_a
+        )
+        client_a = self._login_session(self.app_a)
+        self.assertEqual("Alice", client_a.get("/username").data.decode())
+
+    def test_nested_app_context_restores_outer_selection(self):
+        with self.app_a.test_request_context():
+            self.assertIs(
+                self.login_manager.user_callback, self.load_user_a
+            )
+            with self.app_b.test_request_context():
+                self.assertIs(
+                    self.login_manager.user_callback, self.load_user_b
+                )
+            self.assertIs(
+                self.login_manager.user_callback, self.load_user_a
+            )
+
+    def test_default_registration_remains_instance_default(self):
+        manager = LoginManager()
+        app = Flask("default")
+        manager.init_app(app)
+
+        @manager.user_loader
+        def default_loader(user_id):
+            return notch
+
+        # Outside an app context the instance default is still reachable.
+        self.assertIs(manager.user_callback, default_loader)
+        # An app without its own callback inherits the instance default.
+        with app.test_request_context():
+            self.assertIs(manager.user_callback, default_loader)
+            self.assertIsNone(app.extensions["login_manager"].user_callback)
+
+    def test_app_registration_overrides_instance_default(self):
+        manager = LoginManager()
+        app = Flask("override")
+        app.config["SECRET_KEY"] = "deterministic"
+        manager.init_app(app)
+
+        @manager.unauthorized_handler
+        def default_unauthorized():
+            return Response("default", 401)
+
+        @manager.unauthorized_handler(app=app)
+        def app_unauthorized():
+            return Response("app-specific", 403)
+
+        self.assertIs(manager.unauthorized_callback, default_unauthorized)
+        with app.test_request_context():
+            self.assertIs(manager.unauthorized_callback, app_unauthorized)
+
+        def secret():
+            return current_app.login_manager.unauthorized()
+
+        app.add_url_rule("/secret", "secret", secret)
+        response = app.test_client().get("/secret")
+        self.assertEqual(403, response.status_code)
+        self.assertEqual("app-specific", response.data.decode())
+
+    def test_registration_before_init_app_is_retained(self):
+        manager = LoginManager()
+        app = Flask("early")
+
+        @manager.user_loader(app=app)
+        def early_loader(user_id):
+            return notch
+
+        manager.init_app(app)
+        self.assertIs(app.extensions["login_manager"].user_callback, early_loader)

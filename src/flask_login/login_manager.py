@@ -6,6 +6,7 @@ from flask import abort
 from flask import current_app
 from flask import flash
 from flask import g
+from flask import has_app_context
 from flask import redirect
 from flask import request
 from flask import session
@@ -38,6 +39,25 @@ from .utils import login_url as make_login_url
 from .utils import make_next_param
 
 
+class _AppLoginConfiguration:
+    """Holds the callbacks and the anonymous user factory that belong to a
+    single application. Everything stored here is isolated per app, so a
+    :class:`LoginManager` shared by several applications never leaks one
+    app's authentication state into another.
+
+    Attributes left as ``None`` mean "fall back to the instance default",
+    which keeps applications that register callbacks without naming an app
+    on the manager itself working exactly as before.
+    """
+
+    def __init__(self):
+        self.user_callback = None
+        self.request_callback = None
+        self.anonymous_user = None
+        self.unauthorized_callback = None
+        self.needs_refresh_callback = None
+
+
 class LoginManager:
     """This object is used to hold the settings used for logging in. Instances
     of :class:`LoginManager` are *not* bound to specific apps, so you can
@@ -47,8 +67,9 @@ class LoginManager:
 
     def __init__(self, app=None, add_context_processor=True):
         #: A class or factory function that produces an anonymous user, which
-        #: is used when no one is logged in.
-        self.anonymous_user = AnonymousUserMixin
+        #: is used when no one is logged in. This is the instance default; an
+        #: app registered with :meth:`anonymous_user_loader` uses its own value.
+        self._anonymous_user = AnonymousUserMixin
 
         #: The name of the view to redirect to when the user needs to log in.
         #: (This can be an absolute URL as well, if your authentication
@@ -88,9 +109,9 @@ class LoginManager:
         #: and ``self.needs_refresh_message``
         self.localize_callback = None
 
-        self.unauthorized_callback = None
+        self._unauthorized_callback = None
 
-        self.needs_refresh_callback = None
+        self._needs_refresh_callback = None
 
         self.id_attribute = ID_ATTRIBUTE
 
@@ -102,6 +123,70 @@ class LoginManager:
 
         if app is not None:
             self.init_app(app, add_context_processor)
+
+    @property
+    def anonymous_user(self):
+        """The anonymous user factory for the current app, falling back to
+        the instance default when the app has not registered its own."""
+        config = self._current_app_config()
+        if config is not None and config.anonymous_user is not None:
+            return config.anonymous_user
+        return self._anonymous_user
+
+    @anonymous_user.setter
+    def anonymous_user(self, value):
+        self._anonymous_user = value
+
+    @property
+    def unauthorized_callback(self):
+        config = self._current_app_config()
+        if config is not None and config.unauthorized_callback is not None:
+            return config.unauthorized_callback
+        return self._unauthorized_callback
+
+    @unauthorized_callback.setter
+    def unauthorized_callback(self, value):
+        self._unauthorized_callback = value
+
+    @property
+    def needs_refresh_callback(self):
+        config = self._current_app_config()
+        if config is not None and config.needs_refresh_callback is not None:
+            return config.needs_refresh_callback
+        return self._needs_refresh_callback
+
+    @needs_refresh_callback.setter
+    def needs_refresh_callback(self, value):
+        self._needs_refresh_callback = value
+
+    @property
+    def user_callback(self):
+        """Gets the user_loader callback set by user_loader decorator."""
+        config = self._current_app_config()
+        if config is not None and config.user_callback is not None:
+            return config.user_callback
+        return self._user_callback
+
+    @property
+    def request_callback(self):
+        """Gets the request_loader callback set by request_loader decorator."""
+        config = self._current_app_config()
+        if config is not None and config.request_callback is not None:
+            return config.request_callback
+        return self._request_callback
+
+    def _current_app_config(self):
+        """Return the per-app configuration of the current app, or ``None``
+        when there is no app context or the app was never initialized."""
+        if not has_app_context():
+            return None
+        return current_app.extensions.get("login_manager")
+
+    @staticmethod
+    def _config_for_app(app):
+        """Return the app's configuration, creating it on first use so a
+        callback can be registered before :meth:`init_app`."""
+        return app.extensions.setdefault("login_manager", _AppLoginConfiguration())
 
     def init_app(self, app, add_context_processor=True):
         """
@@ -116,6 +201,9 @@ class LoginManager:
         :type add_context_processor: bool
         """
         app.login_manager = self
+        # Keep any configuration already registered for this app so calling
+        # init_app more than once never resets the app's authentication state.
+        app.extensions.setdefault("login_manager", _AppLoginConfiguration())
         app.after_request(self._update_remember_cookie)
 
         if add_context_processor:
@@ -179,7 +267,7 @@ class LoginManager:
 
         return redirect(redirect_url)
 
-    def user_loader(self, callback):
+    def user_loader(self, callback=None, app=None):
         """
         This sets the callback for reloading a user from the session. The
         function you set should take a user ID (a ``str``) and return a
@@ -187,16 +275,21 @@ class LoginManager:
 
         :param callback: The callback for retrieving a user object.
         :type callback: callable
+        :param app: The application this callback belongs to. If ``None`` the
+            callback is stored as the instance default, which every app uses
+            unless it registers its own. Passing an app keeps the callback
+            isolated from the other applications sharing this manager.
+        :type app: :class:`flask.Flask`
         """
-        self._user_callback = callback
-        return self.user_callback
+        if callback is None:
+            return lambda cb: self.user_loader(cb, app)
+        if app is None:
+            self._user_callback = callback
+        else:
+            self._config_for_app(app).user_callback = callback
+        return callback
 
-    @property
-    def user_callback(self):
-        """Gets the user_loader callback set by user_loader decorator."""
-        return self._user_callback
-
-    def request_loader(self, callback):
+    def request_loader(self, callback=None, app=None):
         """
         This sets the callback for loading a user from a Flask request.
         The function you set should take Flask request object and
@@ -204,16 +297,21 @@ class LoginManager:
 
         :param callback: The callback for retrieving a user object.
         :type callback: callable
+        :param app: The application this callback belongs to. If ``None`` the
+            callback is stored as the instance default, which every app uses
+            unless it registers its own. Passing an app keeps the callback
+            isolated from the other applications sharing this manager.
+        :type app: :class:`flask.Flask`
         """
-        self._request_callback = callback
-        return self.request_callback
+        if callback is None:
+            return lambda cb: self.request_loader(cb, app)
+        if app is None:
+            self._request_callback = callback
+        else:
+            self._config_for_app(app).request_callback = callback
+        return callback
 
-    @property
-    def request_callback(self):
-        """Gets the request_loader callback set by request_loader decorator."""
-        return self._request_callback
-
-    def unauthorized_handler(self, callback):
+    def unauthorized_handler(self, callback=None, app=None):
         """
         This will set the callback for the `unauthorized` method, which among
         other things is used by `login_required`. It takes no arguments, and
@@ -222,11 +320,21 @@ class LoginManager:
 
         :param callback: The callback for unauthorized users.
         :type callback: callable
+        :param app: The application this callback belongs to. If ``None`` the
+            callback is stored as the instance default, which every app uses
+            unless it registers its own. Passing an app keeps the callback
+            isolated from the other applications sharing this manager.
+        :type app: :class:`flask.Flask`
         """
-        self.unauthorized_callback = callback
+        if callback is None:
+            return lambda cb: self.unauthorized_handler(cb, app)
+        if app is None:
+            self._unauthorized_callback = callback
+        else:
+            self._config_for_app(app).unauthorized_callback = callback
         return callback
 
-    def needs_refresh_handler(self, callback):
+    def needs_refresh_handler(self, callback=None, app=None):
         """
         This will set the callback for the `needs_refresh` method, which among
         other things is used by `fresh_login_required`. It takes no arguments,
@@ -235,9 +343,41 @@ class LoginManager:
 
         :param callback: The callback for unauthorized users.
         :type callback: callable
+        :param app: The application this callback belongs to. If ``None`` the
+            callback is stored as the instance default, which every app uses
+            unless it registers its own. Passing an app keeps the callback
+            isolated from the other applications sharing this manager.
+        :type app: :class:`flask.Flask`
         """
-        self.needs_refresh_callback = callback
+        if callback is None:
+            return lambda cb: self.needs_refresh_handler(cb, app)
+        if app is None:
+            self._needs_refresh_callback = callback
+        else:
+            self._config_for_app(app).needs_refresh_callback = callback
         return callback
+
+    def anonymous_user_loader(self, anonymous_user=None, app=None):
+        """
+        This sets the class or factory function that produces an anonymous
+        user when no one is logged in.
+
+        :param anonymous_user: A class or factory function producing an
+            anonymous user.
+        :type anonymous_user: callable
+        :param app: The application this anonymous user belongs to. If
+            ``None`` it is stored as the instance default, which every app
+            uses unless it registers its own. Passing an app keeps it
+            isolated from the other applications sharing this manager.
+        :type app: :class:`flask.Flask`
+        """
+        if anonymous_user is None:
+            return lambda cb: self.anonymous_user_loader(cb, app)
+        if app is None:
+            self._anonymous_user = anonymous_user
+        else:
+            self._config_for_app(app).anonymous_user = anonymous_user
+        return anonymous_user
 
     def needs_refresh(self):
         """
@@ -302,7 +442,10 @@ class LoginManager:
     def _load_user(self):
         """Loads user from session or remember_me cookie as applicable"""
 
-        if self._user_callback is None and self._request_callback is None:
+        user_callback = self.user_callback
+        request_callback = self.request_callback
+
+        if user_callback is None and request_callback is None:
             raise Exception(
                 "Missing user_loader or request_loader. Refer to "
                 "http://flask-login.readthedocs.io/#how-it-works "
@@ -319,8 +462,8 @@ class LoginManager:
 
         # Load user from Flask Session
         user_id = session.get("_user_id")
-        if user_id is not None and self._user_callback is not None:
-            user = self._user_callback(user_id)
+        if user_id is not None and user_callback is not None:
+            user = user_callback(user_id)
 
         # Load user from Remember Me Cookie or Request Loader
         if user is None:
@@ -330,7 +473,7 @@ class LoginManager:
             if has_cookie:
                 cookie = request.cookies[cookie_name]
                 user = self._load_user_from_remember_cookie(cookie)
-            elif self._request_callback:
+            elif request_callback:
                 user = self._load_user_from_request(request)
 
         return self._update_request_context_with_user(user)
@@ -369,8 +512,9 @@ class LoginManager:
             session["_user_id"] = user_id
             session["_fresh"] = False
             user = None
-            if self._user_callback:
-                user = self._user_callback(user_id)
+            user_callback = self.user_callback
+            if user_callback:
+                user = user_callback(user_id)
             if user is not None:
                 app = current_app._get_current_object()
                 user_loaded_from_cookie.send(app, user=user)
@@ -378,8 +522,9 @@ class LoginManager:
         return None
 
     def _load_user_from_request(self, request):
-        if self._request_callback:
-            user = self._request_callback(request)
+        request_callback = self.request_callback
+        if request_callback:
+            user = request_callback(request)
             if user is not None:
                 app = current_app._get_current_object()
                 user_loaded_from_request.send(app, user=user)

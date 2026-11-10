@@ -50,6 +50,63 @@ login with::
 
     login_manager.init_app(app)
 
+Registering Callbacks for Multiple Applications
+------------------------------------------------
+A single `LoginManager` is not bound to one application: an application
+factory can create several apps and call `init_app` on each of them. The
+callbacks and the anonymous user factory can be registered **per
+application** by passing the ``app`` argument, so each app keeps its own
+user model and error responses instead of sharing whatever was registered
+last::
+
+    login_manager = LoginManager()
+
+    def create_app(users):
+        app = Flask(__name__)
+        login_manager.init_app(app)
+
+        @login_manager.user_loader(app=app)
+        def load_user(user_id):
+            return users.get(user_id)
+
+        @login_manager.request_loader(app=app)
+        def load_from_request(request):
+            ...
+
+        @login_manager.unauthorized_handler(app=app)
+        def unauthorized():
+            return Response("login required", 401)
+
+        @login_manager.needs_refresh_handler(app=app)
+        def needs_refresh():
+            return Response("reauthenticate", 440)
+
+        login_manager.anonymous_user_loader(MyAnonymousUser, app=app)
+        return app
+
+The selection always follows the *current* application from the app
+context, so two apps handling the same request cycle (for example nested
+``app.test_request_context()`` blocks) each see their own callbacks, and
+exiting the inner context restores the outer application's selection.
+
+What is still an instance default
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Callbacks registered without an ``app`` argument remain **instance
+defaults** on the `LoginManager` itself. They are shared by every
+application that has not registered its own callback::
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        return User.get(user_id)
+
+    login_manager.anonymous_user = MyAnonymousUser
+
+Anything registered with ``app=...`` is stored on that application in
+``app.extensions["login_manager"]`` and is therefore **application
+configuration**: it is only visible inside that application's context and
+never changes another application's behavior. An application-specific
+callback always takes precedence over the instance default.
+
 
 By default, Flask-Login uses sessions for authentication. This means you must
 set the secret key on your application, otherwise Flask will give you
@@ -269,6 +326,12 @@ to have a permissions field), you can provide a callable (either a class or
 factory function) that creates anonymous users to the `LoginManager` with::
 
     login_manager.anonymous_user = MyAnonymousUser
+
+When several applications share one `LoginManager`, assign an anonymous
+user factory to a single application with
+`~LoginManager.anonymous_user_loader`::
+
+    login_manager.anonymous_user_loader(MyAnonymousUser, app=app)
 
 
 Remember Me
@@ -520,10 +583,14 @@ Configuring Login
 
    .. automethod:: request_loader
 
+   .. automethod:: anonymous_user_loader
+
    .. attribute:: anonymous_user
 
       A class or factory function that produces an anonymous user, which
-      is used when no one is logged in.
+      is used when no one is logged in. Reading this attribute returns the
+      current application's factory when one was registered with
+      `~LoginManager.anonymous_user_loader`, otherwise the instance default.
 
    .. rubric:: `unauthorized` Configuration
 
