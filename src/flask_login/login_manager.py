@@ -1,3 +1,7 @@
+import asyncio
+import contextvars
+import inspect
+import threading
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -185,6 +189,10 @@ class LoginManager:
         function you set should take a user ID (a ``str``) and return a
         user object, or ``None`` if the user does not exist.
 
+        The callback may be declared with ``async def``. In that case it is
+        awaited using Flask's own sync/async bridge, which requires Flask to
+        be installed with the ``async`` extra.
+
         :param callback: The callback for retrieving a user object.
         :type callback: callable
         """
@@ -201,6 +209,10 @@ class LoginManager:
         This sets the callback for loading a user from a Flask request.
         The function you set should take Flask request object and
         return a user object, or `None` if the user does not exist.
+
+        The callback may be declared with ``async def``. In that case it is
+        awaited using Flask's own sync/async bridge, which requires Flask to
+        be installed with the ``async`` extra.
 
         :param callback: The callback for retrieving a user object.
         :type callback: callable
@@ -320,7 +332,7 @@ class LoginManager:
         # Load user from Flask Session
         user_id = session.get("_user_id")
         if user_id is not None and self._user_callback is not None:
-            user = self._user_callback(user_id)
+            user = _call_loader(self._user_callback, user_id)
 
         # Load user from Remember Me Cookie or Request Loader
         if user is None:
@@ -370,7 +382,7 @@ class LoginManager:
             session["_fresh"] = False
             user = None
             if self._user_callback:
-                user = self._user_callback(user_id)
+                user = _call_loader(self._user_callback, user_id)
             if user is not None:
                 app = current_app._get_current_object()
                 user_loaded_from_cookie.send(app, user=user)
@@ -379,7 +391,7 @@ class LoginManager:
 
     def _load_user_from_request(self, request):
         if self._request_callback:
-            user = self._request_callback(request)
+            user = _call_loader(self._request_callback, request)
             if user is not None:
                 app = current_app._get_current_object()
                 user_loaded_from_request.send(app, user=user)
@@ -454,3 +466,57 @@ class LoginManager:
         domain = config.get("REMEMBER_COOKIE_DOMAIN")
         path = config.get("REMEMBER_COOKIE_PATH", "/")
         response.delete_cookie(cookie_name, domain=domain, path=path)
+
+
+def _call_loader(callback, *args):
+    """Call a ``user_loader`` or ``request_loader`` callback.
+
+    Synchronous callbacks are used directly. If the callback returns an
+    awaitable (for example an ``async def`` callback), it is awaited exactly
+    once and the awaited result is returned, so a coroutine is never mistaken
+    for a user object. Any exception the callback raises is propagated
+    unchanged.
+    """
+    result = callback(*args)
+
+    if not inspect.isawaitable(result):
+        return result
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No event loop running in this thread, so the awaitable can be
+        # driven directly with Flask's own sync/async bridge. This requires
+        # Flask to be installed with the ``async`` extra.
+        return current_app.async_to_sync(_await_result)(result)
+
+    # An event loop is already running in this thread (the loader was
+    # triggered from an async view), where Flask's bridge cannot run. Drive
+    # the awaitable to completion on a short-lived thread with its own
+    # event loop, propagating the current Flask context. No persistent event
+    # loop or background thread pool is created.
+    return _await_in_new_thread(result)
+
+
+async def _await_result(awaitable):
+    return await awaitable
+
+
+def _await_in_new_thread(awaitable):
+    context = contextvars.copy_context()
+    outcome = {}
+
+    def runner():
+        try:
+            outcome["result"] = context.run(asyncio.run, _await_result(awaitable))
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join()
+
+    if "error" in outcome:
+        raise outcome["error"]
+
+    return outcome.get("result")

@@ -18,6 +18,8 @@ Unreleased
 - Never look at the `X-Forwarded-For` header, always use `request.remote_addr`,
   requiring the developer to configure `ProxyFix` appropriately. #700
 - Remove `LOGIN_DISABLED` config. #697
+- Support `async def` callbacks for `user_loader` and `request_loader`, awaited
+  through Flask's sync/async bridge. Requires Flask's `async` extra.
 
 
 Version 0.6.3

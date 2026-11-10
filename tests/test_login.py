@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from collections.abc import Hashable
 from contextlib import contextmanager
@@ -1623,3 +1624,228 @@ class CustomTestClientTestCase(unittest.TestCase):
             self.assertEqual("Anonymous", username.data.decode("utf-8"))
             is_fresh = c.get("/is-fresh")
             self.assertEqual("False", is_fresh.data.decode("utf-8"))
+
+
+class AsyncLoaderTestCase(unittest.TestCase):
+    """Tests for async user_loader and request_loader callbacks."""
+
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config["SECRET_KEY"] = "deterministic"
+        self.app.config["SESSION_PROTECTION"] = None
+        self.remember_cookie_name = "remember"
+        self.app.config["REMEMBER_COOKIE_NAME"] = self.remember_cookie_name
+        self.login_manager = LoginManager()
+        self.login_manager.init_app(self.app)
+
+        self.user_loader_calls = []
+        self.request_loader_calls = []
+        self.users_seen_in_views = []
+
+        @self.login_manager.user_loader
+        async def load_user(user_id):
+            self.user_loader_calls.append(user_id)
+            await asyncio.sleep(0)
+            try:
+                return USERS[int(user_id)]
+            except (KeyError, ValueError):
+                return None
+
+        @self.login_manager.request_loader
+        async def load_user_from_request(request):
+            self.request_loader_calls.append(request)
+            await asyncio.sleep(0)
+            user_id = request.args.get("user_id")
+            try:
+                return USERS[int(user_id)]
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        @self.app.route("/login-notch")
+        def login_notch():
+            return str(login_user(notch))
+
+        @self.app.route("/login-notch-remember")
+        def login_notch_remember():
+            return str(login_user(notch, remember=True))
+
+        @self.app.route("/username")
+        def username():
+            self.users_seen_in_views.append(current_user._get_current_object())
+            if current_user.is_authenticated:
+                return current_user.name
+            return "Anonymous"
+
+        @self.app.route("/async-username")
+        async def async_username():
+            self.users_seen_in_views.append(current_user._get_current_object())
+            if current_user.is_authenticated:
+                return current_user.name
+            return "Anonymous"
+
+        @self.app.route("/username-twice")
+        def username_twice():
+            first = current_user._get_current_object()
+            second = current_user._get_current_object()
+            return f"{first is second}"
+
+        unittest.TestCase.setUp(self)
+
+    def _delete_session(self, c):
+        # Helper method to cause the session to be deleted
+        # as if the browser was closed.
+        with c.session_transaction() as sess:
+            sess.clear()
+
+    def test_async_user_loader_with_sync_view(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            result = c.get("/username")
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        self.assertEqual([notch.get_id()], self.user_loader_calls)
+        self.assertEqual([], self.request_loader_calls)
+        self.assertIs(notch, self.users_seen_in_views[-1])
+
+    def test_async_user_loader_with_async_view(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            result = c.get("/async-username")
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        self.assertEqual([notch.get_id()], self.user_loader_calls)
+        self.assertIs(notch, self.users_seen_in_views[-1])
+
+    def test_user_loaded_once_per_request(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            result = c.get("/username-twice")
+            self.assertEqual("True", result.data.decode("utf-8"))
+
+        self.assertEqual(1, len(self.user_loader_calls))
+
+    def test_async_loader_restores_user_from_remember_cookie(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch-remember")
+            self._delete_session(c)
+            with listen_to(user_loaded_from_cookie) as listener:
+                result = c.get("/username")
+                listener.assert_heard_one(self.app, user=notch)
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        # the remember cookie stores the user ID as a string
+        self.assertEqual([str(notch.get_id())], self.user_loader_calls)
+        self.assertIs(notch, self.users_seen_in_views[-1])
+
+    def test_anonymous_when_no_user(self):
+        with self.app.test_client() as c:
+            result = c.get("/username")
+            self.assertEqual("Anonymous", result.data.decode("utf-8"))
+
+        self.assertEqual([], self.user_loader_calls)
+        self.assertEqual(1, len(self.request_loader_calls))
+        self.assertTrue(self.users_seen_in_views[-1].is_anonymous)
+
+    def test_async_loader_returning_none_is_anonymous(self):
+        with self.app.test_client() as c:
+            with c.session_transaction() as sess:
+                sess["_user_id"] = "404"
+            result = c.get("/username")
+            self.assertEqual("Anonymous", result.data.decode("utf-8"))
+
+        self.assertEqual(["404"], self.user_loader_calls)
+
+    def test_async_request_loader(self):
+        with self.app.test_client() as c:
+            with listen_to(user_loaded_from_request) as listener:
+                result = c.get("/username?user_id=1")
+                listener.assert_heard_one(self.app, user=notch)
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        self.assertEqual([], self.user_loader_calls)
+        self.assertEqual(1, len(self.request_loader_calls))
+        self.assertIs(notch, self.users_seen_in_views[-1])
+
+    def test_session_takes_priority_over_request_loader(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            result = c.get("/username?user_id=2")
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        self.assertEqual([notch.get_id()], self.user_loader_calls)
+        self.assertEqual([], self.request_loader_calls)
+
+    def test_remember_cookie_takes_priority_over_request_loader(self):
+        with self.app.test_client() as c:
+            c.get("/login-notch-remember")
+            self._delete_session(c)
+            result = c.get("/username?user_id=2")
+            self.assertEqual("Notch", result.data.decode("utf-8"))
+
+        self.assertEqual([str(notch.get_id())], self.user_loader_calls)
+        self.assertEqual([], self.request_loader_calls)
+
+    def test_async_loader_exception_propagates_from_sync_view(self):
+        @self.login_manager.user_loader
+        async def failing_loader(user_id):
+            await asyncio.sleep(0)
+            raise ValueError("loader boom")
+
+        self.app.config["TESTING"] = True
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            with self.assertRaises(ValueError) as cm:
+                c.get("/username")
+            self.assertEqual("loader boom", str(cm.exception))
+
+    def test_async_loader_exception_propagates_from_async_view(self):
+        @self.login_manager.user_loader
+        async def failing_loader(user_id):
+            await asyncio.sleep(0)
+            raise ValueError("loader boom")
+
+        self.app.config["TESTING"] = True
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            with self.assertRaises(ValueError) as cm:
+                c.get("/async-username")
+            self.assertEqual("loader boom", str(cm.exception))
+
+    def test_nested_test_client_contexts(self):
+        with self.app.test_client() as outer:
+            with self.app.test_client() as inner:
+                inner.get("/login-notch")
+                result = inner.get("/username")
+                self.assertEqual("Notch", result.data.decode("utf-8"))
+            # the outer client has its own cookie jar and is not logged in
+            result = outer.get("/username")
+            self.assertEqual("Anonymous", result.data.decode("utf-8"))
+
+        self.assertEqual([notch.get_id()], self.user_loader_calls)
+        self.assertEqual(1, len(self.request_loader_calls))
+        self.assertIs(notch, self.users_seen_in_views[0])
+        self.assertTrue(self.users_seen_in_views[-1].is_anonymous)
+
+    def test_no_pending_coroutines_after_requests(self):
+        created_coroutines = []
+
+        async def _load(user_id):
+            await asyncio.sleep(0)
+            return USERS.get(int(user_id))
+
+        @self.login_manager.user_loader
+        def load_user(user_id):
+            coro = _load(user_id)
+            created_coroutines.append(coro)
+            return coro
+
+        with self.app.test_client() as c:
+            c.get("/login-notch")
+            c.get("/username")
+            c.get("/async-username")
+
+        self.assertEqual(2, len(created_coroutines))
+        for coro in created_coroutines:
+            # a fully awaited coroutine has no frame left; a pending one
+            # would still hold its frame (and warn when garbage collected)
+            self.assertIsNone(coro.cr_frame)

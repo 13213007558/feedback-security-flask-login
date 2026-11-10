@@ -254,6 +254,30 @@ using the `Authorization` header::
         return None
 
 
+Async Loaders
+=============
+The `~LoginManager.user_loader` and `~LoginManager.request_loader` callbacks
+may also be declared with ``async def``, which is useful when loading a user
+requires async I/O, such as an async database driver::
+
+    @login_manager.user_loader
+    async def load_user(user_id):
+        return await User.get(user_id)
+
+When a callback returns a coroutine, Flask-Login awaits it using Flask's own
+sync/async bridge (`flask.Flask.ensure_sync` and `flask.Flask.async_to_sync`),
+so async callbacks work in both regular and ``async`` views. Flask-Login does
+not create a persistent event loop or background thread pool of its own.
+
+This requires Flask's async support: install Flask with the ``async`` extra
+(which pulls in ``asgiref``)::
+
+    $ pip install flask[async]
+
+Synchronous callbacks continue to be used directly and do not require the
+extra.
+
+
 Anonymous Users
 ===============
 By default, when a user is not actually logged in, `current_user` is set to
